@@ -1,0 +1,21 @@
+# Object and library build artifacts
+*.o
+*.a
+
+# Executables
+ktp_main
+user1
+user2
+
+# LaTeX auxiliary build files
+*.aux
+*.log
+*.out
+*.toc
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+
+# Temporary preview renders
+figures/pdf_pages/
+figures/svg_renders/
