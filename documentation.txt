@@ -1,0 +1,278 @@
+================================================================================
+ASSIGNMENT 4 DOCUMENTATION: KGP TRANSPORT PROTOCOL (KTP)
+CS39006: Networks Laboratory | Spring 2024-25 | IIT Kharagpur
+================================================================================
+NAME: Priyanshu Gourav
+ROLL NUMBER: 22CS10083
+
+
+--------------------------------------------------------------------------------
+1. EXPERIMENTAL EVALUATION: TRANSMISSION RATIO VS DROP PROBABILITY
+--------------------------------------------------------------------------------
+The table below records the average number of transmissions made per generated 
+message across varying packet drop probabilities (p) with timeout T = 2 seconds.
+
+Ratio = Total Transmissions Attempted / Total Messages Generated
+
+PROBABILITY (p)     #TRANSMISSIONS / #MESSAGE_SIZE
+--------------------------------------------------
+0.05                2.7
+0.10                1.1
+0.15                1.7
+0.20                1.6
+0.25                2.1
+0.30                3.6
+0.40                1.7
+0.50                3.2
+
+Analysis:
+- At lower drop rates (p <= 0.10), most packets and acknowledgments are received
+  on the first transmission attempt, keeping the transmission ratio near 1.0.
+- As the probability p increases up to 0.50, packet loss (of either data packets
+  or returning ACKs) triggers timeouts in Thread S, causing retransmissions and 
+  increasing the average transmission ratio.
+
+
+--------------------------------------------------------------------------------
+2. DATA STRUCTURES
+--------------------------------------------------------------------------------
+
+A. queue (Defined in queue.h)
+-----------------------------
+Represents a circular FIFO queue used as a message buffer for sending and receiving.
+Capacity is BUF_SIZE (10) messages of MESSAGE_SIZE (512) bytes each.
+
+Fields:
+- char data[BUF_SIZE][MESSAGE_SIZE]:
+    Two-dimensional array representing the circular buffer holding up to 10
+    messages, each of fixed size 512 bytes.
+- int front:
+    Index pointing to the front (head) of the circular queue where messages are
+    dequeued.
+- int back:
+    Index pointing to the rear (tail) of the circular queue where new messages are
+    enqueued.
+
+
+B. k_sock (Defined in ktp.h)
+----------------------------
+Represents the socket control block stored in the shared memory segment.
+Shared memory maintains an array of SHM_SIZE (10) such structures to support up
+to 10 concurrent active KTP sockets.
+
+Fields:
+- int fd:
+    Underlying UDP socket file descriptor (0 indicates the slot is free/unoccupied).
+- uint16_t dest_port:
+    Destination port number in network byte order (configured via k_bind).
+- uint32_t dest_ip:
+    Destination IPv4 address in network byte order (configured via k_bind).
+- uint16_t src_port:
+    Source port number in network byte order (configured via k_bind).
+- uint32_t src_ip:
+    Source IPv4 address in network byte order (configured via k_bind).
+- uint8_t seq_no:
+    Current sequence number for outgoing data packets (starts at 1, wraps at 256).
+- uint8_t ack_no:
+    Expected sequence number for incoming data packets (starts at 1, wraps at 256).
+- uint8_t state:
+    Current protocol transmission state:
+      * WAITING_FOR_DATA (0): Ready to transmit next message from write_buf.
+      * WAITING_FOR_ACK (1): Message transmitted; awaiting matching ACK or timeout.
+- queue read_buf:
+    Circular receive buffer storing delivered in-order messages ready for
+    consumption by user applications calling k_recvfrom().
+- queue write_buf:
+    Circular send buffer storing messages submitted by user applications calling
+    k_sendto(), awaiting packet framing and transmission by Thread S.
+- struct timespec send_time:
+    High-resolution monotonic timestamp recording when the current unacknowledged
+    packet was transmitted (used by Thread S to detect timeouts).
+
+
+C. Packet Framing / Wire Format (Implemented in ktp_util.c)
+-----------------------------------------------------------
+Packets are transmitted over UDP datagrams with a 3-byte header followed by
+an optional payload:
+
+  Byte 0: flag      - Packet type indicator: DATA (1) or ACK (0).
+  Byte 1: seq_no    - Sequence number of the data packet or sender sequence.
+  Byte 2: ack_no    - Acknowledgment number (next expected sequence number).
+  Bytes 3..N: data  - Payload data (up to 512 bytes for DATA packets; empty for ACKs).
+
+
+--------------------------------------------------------------------------------
+3. FUNCTION SPECIFICATIONS
+--------------------------------------------------------------------------------
+
+A. Socket Library Functions (ktp.c & ktp.h)
+-------------------------------------------
+
+1. k_socket
+   - Arguments:
+       * int domain: Address family (must be AF_INET).
+       * int type: Socket type (must be SOCK_KTP, defined as 100).
+       * int protocol: Protocol family (0).
+   - Purpose:
+       Allocates and initializes a new KTP socket. Attaches to the shared memory
+       segment (key generated with ftok("/", 'a')). Finds an available slot with
+       sock->fd == 0, creates an underlying UDP socket via socket(domain, SOCK_DGRAM, 0),
+       retrieves the local port via getsockname(), sets initial sequence/ACK counters
+       to 1, initializes state to WAITING_FOR_DATA, and returns the allocated UDP fd.
+   - Returns: Socket file descriptor on success, or -1 on error.
+
+2. k_bind
+   - Arguments:
+       * int fd: Socket file descriptor.
+       * struct sockaddr *src_addr: Pointer to local source address structure.
+       * socklen_t src_addrlen: Length of source address structure.
+       * struct sockaddr *dest_addr: Pointer to remote destination address structure.
+       * socklen_t dest_addrlen: Length of destination address structure.
+   - Purpose:
+       Binds the underlying UDP socket to the local source IP and port using bind().
+       Attaches to shared memory, locates the matching socket entry by fd, and records
+       both the source (IP, port) and destination (IP, port) endpoints in the socket table.
+   - Returns: void (exits on failure).
+
+3. k_sendto
+   - Arguments:
+       * int fd: Socket file descriptor.
+       * const void *buf: Pointer to data buffer to be transmitted.
+       * size_t len: Length of data buffer (up to 512 bytes).
+       * int flags: Transmission flags (unused).
+       * const struct sockaddr *dest_addr: Destination address structure.
+       * socklen_t dest_addrlen: Length of destination address structure.
+   - Purpose:
+       Validates that the provided destination IP and port match the bound destination
+       address stored in shared memory. If matched and write_buf is not full, enqueues
+       the message into write_buf for asynchronous transmission by Thread S.
+   - Returns: Number of bytes queued, or -1 if the buffer is full or address mismatch.
+
+4. k_recvfrom
+   - Arguments:
+       * int fd: Socket file descriptor.
+       * void *buf: Destination buffer to copy received data into.
+       * size_t len: Maximum buffer capacity.
+       * int flags: Receive flags (unused).
+       * struct sockaddr *src_addr: Pointer to source address structure to populate.
+       * socklen_t *src_addrlen: Pointer to source address length.
+   - Purpose:
+       Inspects read_buf of the socket in shared memory. If read_buf contains received
+       messages, copies the front message to buf, dequeues it from read_buf, and returns
+       the length copied.
+   - Returns: Number of bytes copied to user buffer, or -1 if read_buf is empty.
+
+5. k_close
+   - Arguments:
+       * int fd: Socket file descriptor to close.
+   - Purpose:
+       Closes the underlying UDP socket descriptor via close(fd) and clears the socket
+       entry in shared memory by setting sock->fd = 0, marking the slot as available.
+   - Returns: void.
+
+
+B. Protocol Daemon Functions & Threads (ktp_main.c)
+---------------------------------------------------
+
+1. main
+   - Purpose:
+       Serves as the KTP daemon entry point. Sets up the SIGINT signal handler, creates
+       and clears the shared memory segment (shmget with IPC_CREAT | IPC_EXCL), spawns
+       Thread R (receiver) and Thread S (sender), waits for them via pthread_join, and
+       performs cleanup upon shutdown.
+   - Returns: 0 on successful termination, 1 on error.
+
+2. handle_sigint
+   - Arguments:
+       * int sig: Signal number (SIGINT).
+   - Purpose:
+       Ensures clean shutdown when Ctrl+C is received. Detaches shared memory (shmdt)
+       and releases the shared memory segment using shmctl(shm_id, IPC_RMID, NULL).
+   - Returns: void.
+
+3. R (Receiver Thread)
+   - Arguments:
+       * void *arg: Thread arguments (NULL).
+   - Purpose:
+       Continuously monitors all active KTP UDP socket file descriptors using select().
+       When data is available on any socket:
+       1. Reads the incoming packet via recvfrom().
+       2. Extracts the flag byte.
+       3. If flag == ACK: invokes handle_ACK() to update sequence numbers and dequeue
+          the sent message from write_buf.
+       4. If flag == DATA: invokes handle_DATA() to verify sequence order, enqueue payload
+          into read_buf, and send a positive acknowledgment (ACK) to the peer.
+   - Returns: NULL.
+
+4. S (Sender Thread)
+   - Arguments:
+       * void *arg: Thread arguments (NULL).
+   - Purpose:
+       Periodically wakes up every T/2 seconds to service active sockets:
+       1. For sockets in WAITING_FOR_ACK state: Checks if elapsed time since send_time
+          exceeds timeout T. If timed out, retransmits the message from write_buf,
+          updates send_time, and remains in WAITING_FOR_ACK.
+       2. For sockets in WAITING_FOR_DATA state: If write_buf is not empty, constructs a
+          DATA packet from the front of write_buf, transmits it over UDP to dest_ip:dest_port,
+          records send_time, and transitions state to WAITING_FOR_ACK.
+   - Returns: NULL.
+
+
+C. Packet Framing & Utility Functions (ktp_util.c & queue.c)
+------------------------------------------------------------
+
+1. get_flag
+   - Arguments: void *buffer
+   - Purpose: Returns the packet type flag from byte 0 (DATA or ACK).
+
+2. get_seq_num
+   - Arguments: void *buffer
+   - Purpose: Extracts and returns the sequence number from byte 1.
+
+3. get_ack_num
+   - Arguments: void *buffer
+   - Purpose: Extracts and returns the acknowledgment number from byte 2.
+
+4. has_data
+   - Arguments: void *buffer
+   - Purpose: Checks whether the packet buffer contains payload beyond the 3-byte header.
+
+5. get_data
+   - Arguments: void *buffer
+   - Purpose: Returns a pointer to the payload data beginning at offset 3.
+
+6. make_packet
+   - Arguments: uint8_t flag, uint8_t seq_no, uint8_t ack_no, char *data
+   - Purpose: Dynamically allocates and constructs a packet buffer containing the 3-byte
+              header (flag, seq_no, ack_no) and appends data payload if provided.
+   - Returns: Pointer to the allocated packet buffer.
+
+7. send_ACK
+   - Arguments: k_sock *sock, char *buffer
+   - Purpose: Formulates an ACK packet with sock->seq_no and sock->ack_no, and transmits
+              it to sock->dest_ip and sock->dest_port using UDP sendto().
+
+8. handle_ACK
+   - Arguments: k_sock *sock, char *buffer
+   - Purpose: Validates incoming ACK. If sock is WAITING_FOR_ACK and ack_num matches
+              (sock->seq_no + 1) % MAX_SEQ_NO, increments sock->seq_no, transitions
+              state to WAITING_FOR_DATA, and dequeues the acknowledged message from write_buf.
+
+9. handle_DATA
+   - Arguments: k_sock *sock, char *buffer
+   - Purpose: Validates incoming DATA packet. If sequence number matches expected
+              sock->ack_no, enqueues payload into read_buf, increments expected ack_no,
+              and returns an ACK to the sender.
+
+10. dropMessage
+    - Arguments: float p
+    - Purpose: Generates a pseudo-random value between 0.0 and 1.0. Returns 1 if the
+               value is less than p (simulating packet loss), or 0 to proceed with processing.
+
+11. Queue Functions (queue.c):
+    - init_queue(queue *q): Initializes queue front and back pointers and clears data.
+    - enqueue(queue *q, char *data): Inserts a 512-byte message at back of queue.
+    - dequeue(queue *q): Removes front message from circular queue.
+    - is_empty(queue *q): Returns 1 if queue contains 0 elements, 0 otherwise.
+    - is_full(queue *q): Returns 1 if queue capacity (BUF_SIZE) is exhausted, 0 otherwise.
+================================================================================
