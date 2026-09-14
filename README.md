@@ -1,6 +1,4 @@
 # KTP: KGP Transport Protocol
-**CS39006: Networks Laboratory | Department of Computer Science & Engineering, IIT Kharagpur**
-
 ---
 
 ## Overview
